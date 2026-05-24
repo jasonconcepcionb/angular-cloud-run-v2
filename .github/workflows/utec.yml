@@ -1,144 +1,161 @@
-name: Deploy to Google Cloud Run - Service Account Key (Multi-User)
+name: Deploy Canary to Cloud Run
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
 
 env:
-  GCP_PROJECT_ID: "utec-posgrado-01"
-  GCP_REGION: "us-central1"
-  ARTIFACT_REGISTRY_REPO: "app-gemini" 
-
+  GCP_PROJECT_ID: utec-posgrado-01
+  GCP_REGION: us-central1
+  ARTIFACT_REGISTRY: us-central1-docker.pkg.dev/utec-posgrado-01/app-gemini-jasoncb1993
+  
 jobs:
-  # 1. JOB DE CONSTRUCCIÓN Y DESPLIEGUE INICIAL / CANARY (10%)
   build_and_canary:
-    environment: dev
     runs-on: ubuntu-latest
-    permissions:
-      contents: 'read'
     outputs:
       is_first_deploy: ${{ steps.check_service.outputs.is_first_deploy }}
-
+    
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Google Auth (JSON Key)
-        uses: 'google-github-actions/auth@v3'
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up Cloud SDK
-        uses: 'google-github-actions/setup-gcloud@v2'
+        uses: google-github-actions/setup-gcloud@v2
 
-      - name: Docker Auth
-        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+      - name: Build and Push Docker Image
+        run: |
+          SERVICE_NAME="gemini-angular-${{ secrets.ALUMNO_ID }}-${{ secrets.ENVIRONMENT_NAME }}"
+          IMAGE_TAG="${{ env.ARTIFACT_REGISTRY }}/app-${{ secrets.ALUMNO_ID }}:${{ github.sha }}"
+          
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "SERVICE_NAME=$SERVICE_NAME" >> $GITHUB_ENV
 
       - name: Check if Service Exists
         id: check_service
         run: |
-          SERVICE_NAME="gemini-angular-${{ secrets.ALUMNO_ID }}-${{ secrets.ENVIRONMENT_NAME }}"
-          if gcloud run services describe "$SERVICE_NAME" --region ${{ env.GCP_REGION }} >/dev/null 2>&1; then
+          if gcloud run services describe ${{ env.SERVICE_NAME }} \
+             --region=${{ env.GCP_REGION }} &>/dev/null; then
             echo "is_first_deploy=false" >> $GITHUB_OUTPUT
-            echo "El servicio ya existe. Procediendo con Canary (10%)."
+            echo "✅ Servicio existe - Deploy Canary 10%"
           else
             echo "is_first_deploy=true" >> $GITHUB_OUTPUT
-            echo "Primera vez. Se enviará el 100% del tráfico."
+            echo "🆕 Primer deploy - 100% del tráfico"
           fi
 
-      - name: Build and Deploy (Canary logic)
+      - name: Deploy to Cloud Run (Canary or First Deploy)
         run: |
-          SERVICE_NAME="gemini-angular-${{ secrets.ALUMNO_ID }}-${{ secrets.ENVIRONMENT_NAME }}"
-          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/app-${{ secrets.ALUMNO_ID }}:${{ github.sha }}"
-
-          docker build -t "$IMAGE_TAG" .
-          docker push "$IMAGE_TAG"
-
-          if [ "${{ steps.check_service.outputs.is_first_deploy }}" = "true" ]; then
-            gcloud run deploy "$SERVICE_NAME" \
-              --image "$IMAGE_TAG" \
-              --region ${{ env.GCP_REGION }} \
-              --platform managed \
+          if [ "${{ steps.check_service.outputs.is_first_deploy }}" == "true" ]; then
+            # Primer deploy: 100% del tráfico
+            gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image=${{ env.IMAGE_TAG }} \
+              --region=${{ env.GCP_REGION }} \
+              --platform=managed \
               --allow-unauthenticated \
-              --set-env-vars="ENVIRONMENT_NAME=${{ secrets.ENVIRONMENT_NAME }}"
+              --tag=canary
           else
-            # 1. Obtener la revisión principal actual (separa por ';' y toma la primera)
-            PREVIOUS_REV=$(gcloud run services describe "$SERVICE_NAME" --region ${{ env.GCP_REGION }} --format="value(status.traffic.revisionName)" | tr ';' '\n' | head -n 1)
-            echo "La versión estable base es: $PREVIOUS_REV"
-
-            # 2. Desplegar la nueva imagen sin tráfico
-            gcloud run deploy "$SERVICE_NAME" \
-              --image "$IMAGE_TAG" \
-              --region ${{ env.GCP_REGION }} \
-              --platform managed \
-              --allow-unauthenticated \
+            # Deploy Canary: 10% del tráfico a la nueva versión
+            gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image=${{ env.IMAGE_TAG }} \
+              --region=${{ env.GCP_REGION }} \
+              --platform=managed \
               --no-traffic \
-              --set-env-vars="ENVIRONMENT_NAME=${{ secrets.ENVIRONMENT_NAME }}"
+              --tag=canary
             
-            # 3. Capturar el nombre de la NUEVA revisión Canary recién creada
-            CANARY_REV=$(gcloud run services describe "$SERVICE_NAME" --region ${{ env.GCP_REGION }} --format="value(status.latestCreatedRevisionName)")
+            # Distribuir tráfico: 90% estable, 10% canary
+            LATEST_REVISION=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+              --region=${{ env.GCP_REGION }} \
+              --format='value(status.latestReadyRevisionName)')
             
-            # 4. Aplicar el tráfico dinámicamente
-            echo "Asignando 90% a $PREVIOUS_REV y 10% a $CANARY_REV"
-            gcloud run services update-traffic "$SERVICE_NAME" \
-              --region ${{ env.GCP_REGION }} \
-              --to-revisions="$PREVIOUS_REV=90,$CANARY_REV=10"
+            STABLE_REVISION=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+              --region=${{ env.GCP_REGION }} \
+              --format='value(status.traffic[0].revisionName)')
+            
+            gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
+              --region=${{ env.GCP_REGION }} \
+              --to-revisions=$LATEST_REVISION=10,$STABLE_REVISION=90
           fi
 
-  # 2. JOB DE APROBACIÓN MANUAL
+      - name: Get Service URL
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.GCP_REGION }} \
+            --format='value(status.url)')
+          echo "🌐 Service URL: $SERVICE_URL"
+          echo "SERVICE_URL=$SERVICE_URL" >> $GITHUB_ENV
+
   promote_or_rollback:
+    runs-on: ubuntu-latest
     needs: build_and_canary
     if: needs.build_and_canary.outputs.is_first_deploy == 'false'
     environment: dev
-    runs-on: ubuntu-latest
+    
     steps:
-      - name: Google Auth
-        uses: 'google-github-actions/auth@v3'
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up Cloud SDK
-        uses: 'google-github-actions/setup-gcloud@v2'
+        uses: google-github-actions/setup-gcloud@v2
 
-      - name: Promote Canary to 100% Traffic
+      - name: Promote Canary to 100%
         run: |
           SERVICE_NAME="gemini-angular-${{ secrets.ALUMNO_ID }}-${{ secrets.ENVIRONMENT_NAME }}"
           
-          # Buscamos de forma dinámica cuál fue la última revisión creada (el Canary)
-          CANARY_REV=$(gcloud run services describe "$SERVICE_NAME" --region ${{ env.GCP_REGION }} --format="value(status.latestCreatedRevisionName)")
+          CANARY_REVISION=$(gcloud run services describe $SERVICE_NAME \
+            --region=${{ env.GCP_REGION }} \
+            --format='value(status.latestReadyRevisionName)')
           
-          echo "Promoviendo la revisión $CANARY_REV al 100% de tráfico."
-          gcloud run services update-traffic "$SERVICE_NAME" \
-            --region ${{ env.GCP_REGION }} \
-            --to-revisions="$CANARY_REV=100"
+          gcloud run services update-traffic $SERVICE_NAME \
+            --region=${{ env.GCP_REGION }} \
+            --to-revisions=$CANARY_REVISION=100
+          
+          echo "✅ Canary promovido al 100% del tráfico"
 
-  # 3. JOB AUTOMÁTICO EN CASO DE RECHAZO O FALLO (ROLLBACK)
   rollback_canary:
-    needs: [build_and_canary, promote_or_rollback]
-    if: always() && needs.build_and_canary.outputs.is_first_deploy == 'false' && (needs.promote_or_rollback.result == 'failure' || needs.promote_or_rollback.result == 'cancelled')
-    environment: dev
     runs-on: ubuntu-latest
+    needs: [build_and_canary, promote_or_rollback]
+    if: |
+      always() && 
+      needs.build_and_canary.outputs.is_first_deploy == 'false' &&
+      (needs.promote_or_rollback.result == 'failure' || 
+       needs.promote_or_rollback.result == 'cancelled')
+    
     steps:
-      - name: Google Auth
-        uses: 'google-github-actions/auth@v3'
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up Cloud SDK
-        uses: 'google-github-actions/setup-gcloud@v2'
+        uses: google-github-actions/setup-gcloud@v2
 
-      - name: Rollback Traffic (Remove Canary)
+      - name: Rollback to Stable Version
         run: |
           SERVICE_NAME="gemini-angular-${{ secrets.ALUMNO_ID }}-${{ secrets.ENVIRONMENT_NAME }}"
           
-          # 1. Identificar la revisión Canary (la que vamos a descartar)
-          CANARY_REV=$(gcloud run services describe "$SERVICE_NAME" --region ${{ env.GCP_REGION }} --format="value(status.latestCreatedRevisionName)")
+          STABLE_REVISION=$(gcloud run services describe $SERVICE_NAME \
+            --region=${{ env.GCP_REGION }} \
+            --format='value(status.traffic[0].revisionName)')
           
-          # 2. Obtener lista de revisiones, separar por saltos de línea, EXCLUIR el Canary y tomar la que quede
-          STABLE_REV=$(gcloud run services describe "$SERVICE_NAME" --region ${{ env.GCP_REGION }} --format="value(status.traffic.revisionName)" | tr ';' '\n' | grep -v "$CANARY_REV" | head -n 1)
+          gcloud run services update-traffic $SERVICE_NAME \
+            --region=${{ env.GCP_REGION }} \
+            --to-revisions=$STABLE_REVISION=100
           
-          echo "El despliegue fue rechazado. Revirtiendo el 100% a la versión estable: $STABLE_REV"
-          gcloud run services update-traffic "$SERVICE_NAME" \
-            --region ${{ env.GCP_REGION }} \
-            --to-revisions="$STABLE_REV=100"
+          echo "🔄 Rollback completado - versión estable al 100%"
+EOF
+
+echo "✅ Workflow creado en .github/workflows/utec.yml"
